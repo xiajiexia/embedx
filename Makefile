@@ -1,16 +1,12 @@
-.PHONY: build run test clean install uninstall
+.PHONY: build run test clean install start stop uninstall
 
 # Build the binary
 build:
 	go build -o embedx .
 
-# Run locally (requires FastEmbed model)
+# Run locally
 run:
 	./embedx
-
-# Run with custom port
-dev:
-	EMBEDX_PORT=11450 EMBEDX_MODEL=BAAI/bge-small-zh-v1.5 ./embedx
 
 # Test the API
 test:
@@ -21,10 +17,6 @@ test:
 # Health check
 health:
 	curl http://localhost:11434/health
-
-# List models
-models:
-	curl http://localhost:11434/api/tags
 
 # Clean build artifacts
 clean:
@@ -37,8 +29,6 @@ install: build
 	sudo cp embed.py /opt/embedx/
 	sudo chmod +x /opt/embedx/embedx
 
-# Install systemd service
-service-install:
 	sudo tee /etc/systemd/system/embedx.service > /dev/null <<EOF
 [Unit]
 Description=embedx - FastEmbed with Ollama-compatible API
@@ -61,25 +51,21 @@ EOF
 	sudo systemctl enable embedx
 
 # Start the service
-service-start:
+start:
 	sudo systemctl start embedx
 
 # Stop the service
-service-stop:
+stop:
 	sudo systemctl stop embedx
 
-# Service status
-service-status:
-	sudo systemctl status embedx
-
-# View service logs
-service-logs:
-	journalctl -u embedx -f
+# View logs
+logs:
+	sudo journalctl -u embedx -f
 
 # Uninstall
 uninstall:
-	sudo systemctl stop embedx
-	sudo systemctl disable embedx
-	sudo rm /etc/systemd/system/embedx.service
+	sudo systemctl stop embedx || true
+	sudo systemctl disable embedx || true
+	sudo rm -f /etc/systemd/system/embedx.service
 	sudo systemctl daemon-reload
 	sudo rm -rf /opt/embedx
