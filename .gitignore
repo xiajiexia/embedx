@@ -1,0 +1,21 @@
+# Binaries
+embedx
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment
+.env
+.env.local
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local models (download at runtime)
+models/
