@@ -78,7 +78,7 @@ curl -X POST http://localhost:11434/api/pull \
   -d '{"name": "BAAI/bge-base-en-v1.5", "stream": true}'
 ```
 
-> **Note**: Set `EMBEDX_PROXY` environment variable to use a proxy when downloading models from HuggingFace.
+
 
 ## Configuration
 
@@ -86,7 +86,6 @@ curl -X POST http://localhost:11434/api/pull \
 |----------|---------|-------------|
 | `EMBEDX_PORT` | `11434` | HTTP server port |
 | `EMBEDX_MODEL` | `BAAI/bge-small-zh-v1.5` | Default embedding model |
-| `EMBEDX_PROXY` | _(none)_ | Proxy URL for model downloads (e.g. `http://127.0.0.1:7890`) |
 
 ## Supported Models
 

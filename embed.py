@@ -17,30 +17,19 @@ from typing import Optional
 
 from fastembed import TextEmbedding
 from fastembed.model_description import ModelSource
-import huggingface_hub
 
 # Default cache directory (FastEmbed default)
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "fastembed"
 
-# Proxy settings from environment
-_EMBEDX_PROXY = os.environ.get("EMBEDX_PROXY", "")
-
 
 def setup_proxy():
-    """Set HTTP/HTTPS proxy from EMBEDX_PROXY env var."""
-    global _EMBEDX_PROXY
-    _EMBEDX_PROXY = os.environ.get("EMBEDX_PROXY", "")
-    if not _EMBEDX_PROXY:
-        return
-    # Support both http:// and https:// prefixes
-    proxy = _EMBEDX_PROXY
-    if not proxy.startswith("http://") and not proxy.startswith("https://"):
-        proxy = "http://" + proxy
-    os.environ["HTTP_PROXY"] = proxy
-    os.environ["HTTPS_PROXY"] = proxy
-    os.environ["http_proxy"] = proxy
-    os.environ["https_proxy"] = proxy
-    print(f"Proxy enabled: {proxy}", file=sys.stderr, flush=True)
+    """Log proxy settings from standard environment variables."""
+    http_proxy = os.environ.get("HTTP_PROXY", "") or os.environ.get("http_proxy", "")
+    https_proxy = os.environ.get("HTTPS_PROXY", "") or os.environ.get("https_proxy", "")
+    if http_proxy or https_proxy:
+        print(f"Proxy active: HTTP={http_proxy}, HTTPS={https_proxy}", file=sys.stderr, flush=True)
+    else:
+        print("Proxy: not set (direct connection)", file=sys.stderr, flush=True)
 
 # Model cache: name -> TextEmbedding instance
 _model_cache: dict[str, TextEmbedding] = {}
