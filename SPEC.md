@@ -9,25 +9,19 @@
 ### Components
 
 1. **Go HTTP Server** - Exposes Ollama-compatible API on port 11434
-2. **Python Subprocess** - FastEmbed backend, called via stdin/stdout pipes
+2. **Python Subprocess** - FastEmbed backend, called via stdin/stdout pipes with JSON protocol
 
 ### Data Flow
 
 ```
-Client Request
+Client Request (Ollama-compatible API)
     ↓
 Go HTTP Server (:11434)
     ↓ JSON via stdin/stdout pipe
 Python Subprocess (FastEmbed)
     ↓
-Return embedding to client
+Return embedding / status to client
 ```
-
-## Key Design Decisions
-
-- **Go HTTP**: Excellent HTTP performance, Ollama-compatible API
-- **Python subprocess via pipe**: Direct communication, no HTTP overhead
-- **No separate Python HTTP server**: Simpler architecture, faster
 
 ## API Specification
 
@@ -35,63 +29,141 @@ Return embedding to client
 
 Ollama-compatible embedding generation.
 
-**Request Body:**
+**Request:**
 ```json
 {
-  "model": "string (optional)",
-  "prompt": "string (required)"
+  "model": "BAAI/bge-small-zh-v1.5",   // optional, defaults to EMBEDX_MODEL
+  "prompt": "your text here"
 }
 ```
 
 **Response:**
 ```json
 {
-  "embedding": [float32]
+  "embedding": [0.003, 0.064, -0.045, ...]
 }
+```
+
+### POST /api/pull
+
+Ollama-compatible model download.
+
+**Request:**
+```json
+{
+  "name": "BAAI/bge-base-zh-v1.5",
+  "stream": false
+}
+```
+
+**Response (non-streaming):**
+```json
+{
+  "status": "success",
+  "model": "BAAI/bge-base-zh-v1.5",
+  "dimensions": 768
+}
+```
+
+**Response (streaming, SSE):**
+```
+event: status
+data: {"status":"pulling","model":"BAAI/bge-base-zh-v1.5"}
+
+event: done
+data: {"status":"success","model":"BAAI/bge-base-zh-v1.5"}
+```
+
+### POST /api/create
+
+Load a model into memory (does not persist, use `/api/pull` for that).
+
+**Request:**
+```json
+{"name": "BAAI/bge-base-zh-v1.5"}
+```
+
+**Response:**
+```json
+{"status": "success", "model": "BAAI/bge-base-zh-v1.5", "dimensions": 768}
+```
+
+### POST /api/show
+
+Get model information after loading.
+
+**Request:**
+```json
+{"name": "BAAI/bge-base-zh-v1.5"}
 ```
 
 ### GET /api/tags
 
-List available models.
+List available (cached) models.
+
+**Response:**
+```json
+{
+  "models": [
+    {"name": "BAAI/bge-small-zh-v1.5", "model": "BAAI/bge-small-zh-v1.5", "size": 0}
+  ]
+}
+```
 
 ### GET /health
 
 Health check - returns 200 OK.
 
-## Implementation Details
+## Python Protocol
 
-### Communication Protocol
+Go communicates with Python via JSON messages on stdin/stdout.
 
-- Go spawns Python subprocess at startup
-- Python loads model and signals READY on stdout
-- Each embedding request: Go writes JSON to Python stdin, reads JSON from stdout
-- Synchronous request/response per call
+### Commands (Go → Python)
 
-### Performance
+```json
+{"command": "embed", "model_name": "...", "texts": ["..."]}
+{"command": "load", "model_name": "..."}
+{"command": "pull", "model_name": "..."}
+{"command": "unload", "model_name": "..."}
+{"command": "list_cached"}
+```
 
-| Component | Performance |
-|-----------|-------------|
-| Go HTTP | Excellent |
-| Pipe communication | Fast (no network stack) |
-| FastEmbed inference | CPU-bound |
+### Responses (Python → Go)
+
+```json
+{"type": "embed_done", "embeddings": [[0.1, 0.2, ...]]}
+{"type": "model_loaded", "model": "...", "dimensions": 512, "cached": ["..."]}
+{"type": "pull_done", "model": "...", "dimensions": 512}
+{"type": "error", "error": "..."}
+```
+
+## Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `EMBEDX_PORT` | `11434` | HTTP server port |
+| `EMBEDX_MODEL` | `BAAI/bge-small-zh-v1.5` | Default embedding model |
+
+## Supported Models
+
+All FastEmbed-supported models. Popular choices:
+
+| Model | Dimensions | Languages |
+|-------|------------|-----------|
+| `BAAI/bge-small-zh-v1.5` | 512 | Chinese + English |
+| `BAAI/bge-base-en-v1.5` | 768 | English |
+| `nomic-ai/nomic-embed-text-v1.5` | 768 | English (multimodal) |
+| `jinaai/jina-embeddings-v2-base-en` | 768 | English |
+| `mixedbread-ai/mxbai-embed-large-v1` | 1024 | English |
 
 ## File Structure
 
 ```
 embedx/
 ├── main.go       # Go HTTP server + subprocess management
-├── embed.py      # Python CLI (stdin/stdout)
+├── embed.py      # Python CLI (stdin/stdout protocol)
 ├── go.mod        # Go module
-└── README.md     # Documentation
+├── Makefile      # Build commands
+├── README.md     # User documentation
+└── SPEC.md       # This file
 ```
-
-## Status
-
-**Completed:**
-- [x] Ollama-compatible `/api/embeddings` endpoint
-- [x] Go HTTP server (high performance)
-- [x] Python subprocess pipe communication (no HTTP overhead)
-- [x] FastEmbed backend integration
-- [x] Chinese embedding support
-- [x] Configuration via environment variables
-- [x] Health check endpoint

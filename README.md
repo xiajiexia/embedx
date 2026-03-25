@@ -5,6 +5,9 @@ A drop-in replacement for Ollama's embedding API, powered by FastEmbed.
 ## Features
 
 - **Ollama-compatible API** - Uses the same `/api/embeddings` endpoint as Ollama
+- **Model hot-switching** - Switch models on-the-fly via `model` parameter
+- **Model pull** - Download and cache models via `/api/pull` (Ollama-compatible)
+- **Multiple model caching** - Keep multiple models loaded simultaneously
 - **FastEmbed backend** - High-quality Chinese and English embeddings
 - **Easy migration** - Replace Ollama's embedding endpoint with embedx
 - **Zero configuration** - Works out of the box with sensible defaults
@@ -13,8 +16,8 @@ A drop-in replacement for Ollama's embedding API, powered by FastEmbed.
 
 ```
 HTTP API (embedx :11434)
-    └── FastEmbed Python server (127.0.0.1:xxxxx)
-            └── BAAI/bge-small-zh-v1.5 model
+    └── FastEmbed Python server (127.0.0.0)
+            └── Cached models in ~/.cache/fastembed
 ```
 
 ## Quick Start
@@ -34,39 +37,46 @@ go build -o embedx .
 ### 3. Test
 
 ```bash
+# Generate embedding
 curl -X POST http://localhost:11434/api/embeddings \
   -H "Content-Type: application/json" \
   -d '{"model": "BAAI/bge-small-zh-v1.5", "prompt": "你好世界"}'
+
+# Pull a model
+curl -X POST http://localhost:11434/api/pull \
+  -H "Content-Type: application/json" \
+  -d '{"name": "BAAI/bge-base-en-v1.5"}'
+
+# List cached models
+curl http://localhost:11434/api/tags
 ```
 
 ## API Endpoints
 
-### POST /api/embeddings
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/embeddings` | POST | Generate embedding |
+| `/api/pull` | POST | Download/cache a model |
+| `/api/create` | POST | Load model into memory |
+| `/api/show` | POST | Get model info |
+| `/api/tags` | GET | List cached models |
+| `/health` | GET | Health check |
 
-Ollama-compatible embedding endpoint.
+### Switch model via `model` parameter
 
-**Request:**
-```json
-{
-  "model": "BAAI/bge-small-zh-v1.5",
-  "prompt": "your text here"
-}
+```bash
+curl -X POST http://localhost:11434/api/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"model": "BAAI/bge-base-en-v1.5", "prompt": "hello world"}'
 ```
 
-**Response:**
-```json
-{
-  "embedding": [0.003, 0.064, -0.045, ...]
-}
+### Pull with SSE streaming
+
+```bash
+curl -X POST http://localhost:11434/api/pull \
+  -H "Content-Type: application/json" \
+  -d '{"name": "BAAI/bge-base-en-v1.5", "stream": true}'
 ```
-
-### GET /api/tags
-
-List available models.
-
-### GET /health
-
-Health check endpoint.
 
 ## Configuration
 
@@ -77,9 +87,16 @@ Health check endpoint.
 
 ## Supported Models
 
-| Model | Dimensions | Languages | Description |
-|-------|------------|-----------|-------------|
-| `BAAI/bge-small-zh-v1.5` | 512 | Chinese + English | Default, optimized for Chinese |
+All [FastEmbed-supported models](https://qdrant.github.io/fastembed/examples/Supported_Models/).
+
+Popular choices:
+
+| Model | Dimensions | Languages |
+|-------|------------|-----------|
+| `BAAI/bge-small-zh-v1.5` | 512 | Chinese + English |
+| `BAAI/bge-base-en-v1.5` | 768 | English |
+| `nomic-ai/nomic-embed-text-v1.5` | 768 | English |
+| `mixedbread-ai/mxbai-embed-large-v1` | 1024 | English |
 
 ## Systemd Service
 
@@ -108,6 +125,7 @@ Install and start:
 
 ```bash
 sudo cp embedx /opt/embedx/
+sudo cp embed.py /opt/embedx/
 sudo systemctl daemon-reload
 sudo systemctl enable embedx
 sudo systemctl start embedx

@@ -14,6 +14,16 @@ test:
 		-H "Content-Type: application/json" \
 		-d '{"model": "BAAI/bge-small-zh-v1.5", "prompt": "你好世界"}'
 
+# Test pull
+test-pull:
+	curl -X POST http://localhost:11434/api/pull \
+		-H "Content-Type: application/json" \
+		-d '{"name": "BAAI/bge-base-en-v1.5"}'
+
+# Test list models
+test-tags:
+	curl http://localhost:11434/api/tags
+
 # Health check
 health:
 	curl http://localhost:11434/health
