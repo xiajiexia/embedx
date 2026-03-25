@@ -17,9 +17,30 @@ from typing import Optional
 
 from fastembed import TextEmbedding
 from fastembed.model_description import ModelSource
+import huggingface_hub
 
 # Default cache directory (FastEmbed default)
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "fastembed"
+
+# Proxy settings from environment
+_EMBEDX_PROXY = os.environ.get("EMBEDX_PROXY", "")
+
+
+def setup_proxy():
+    """Set HTTP/HTTPS proxy from EMBEDX_PROXY env var."""
+    global _EMBEDX_PROXY
+    _EMBEDX_PROXY = os.environ.get("EMBEDX_PROXY", "")
+    if not _EMBEDX_PROXY:
+        return
+    # Support both http:// and https:// prefixes
+    proxy = _EMBEDX_PROXY
+    if not proxy.startswith("http://") and not proxy.startswith("https://"):
+        proxy = "http://" + proxy
+    os.environ["HTTP_PROXY"] = proxy
+    os.environ["HTTPS_PROXY"] = proxy
+    os.environ["http_proxy"] = proxy
+    os.environ["https_proxy"] = proxy
+    print(f"Proxy enabled: {proxy}", file=sys.stderr, flush=True)
 
 # Model cache: name -> TextEmbedding instance
 _model_cache: dict[str, TextEmbedding] = {}
@@ -62,6 +83,7 @@ def get_cached_models() -> list[str]:
 
 def pull_model(model_name: str, stream_callback=None):
     """Pull a model (download + verify) and return its dimensions."""
+    setup_proxy()
     print(json.dumps({"status": "pulling", "model": model_name}), flush=True)
     try:
         # Trigger download by creating a temporary embedding instance
@@ -86,6 +108,8 @@ def pull_model(model_name: str, stream_callback=None):
 def load_model(model_name: str):
     """Load a model into the cache (download if needed, then cache)."""
     global _current_model
+
+    setup_proxy()
 
     if model_name not in _model_cache:
         print(json.dumps({"status": "loading", "model": model_name}), flush=True, file=sys.stderr)
@@ -152,6 +176,9 @@ def handle_command(data: dict) -> dict:
 
 def main():
     global _current_model
+
+    # Setup proxy from environment before any network calls
+    setup_proxy()
 
     default_model = sys.argv[1] if len(sys.argv) > 1 else "BAAI/bge-small-zh-v1.5"
     

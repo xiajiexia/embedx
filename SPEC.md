@@ -143,6 +143,7 @@ Go communicates with Python via JSON messages on stdin/stdout.
 |----------|---------|-------------|
 | `EMBEDX_PORT` | `11434` | HTTP server port |
 | `EMBEDX_MODEL` | `BAAI/bge-small-zh-v1.5` | Default embedding model |
+| `EMBEDX_PROXY` | _(none)_ | Proxy URL for model downloads (e.g. `http://127.0.0.1:7890`) |
 
 ## Supported Models
 
