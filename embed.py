@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Optional
 
 from fastembed import TextEmbedding
-from fastembed.model_description import ModelSource
 
 # Default cache directory (FastEmbed default)
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "fastembed"
@@ -125,7 +124,7 @@ def pull_model(model_name: str, stream_callback=None):
         # Trigger download by creating a temporary embedding instance
         # This will download the model if not cached
         emb = TextEmbedding(model_name=model_name)
-        dims = emb.model_description.dim
+        dims = emb.embedding_size
         elapsed = time.time() - start
         log_info("pull_model DONE", model=model_name, dimensions=dims, elapsed_ms=int(elapsed*1000), cached=get_cached_models())
         print(json.dumps({
@@ -163,7 +162,7 @@ def load_model(model_name: str):
 
     with _cache_lock:
         _current_model = model_name
-        desc = _model_cache[model_name].model_description
+        desc = _model_cache[model_name]
 
     log_info("load_model COMPLETE", model=model_name, dimensions=desc.dim, max_length=desc.max_length, cached=list(_model_cache.keys()))
     print(json.dumps({
@@ -250,14 +249,13 @@ def main():
         start = time.time()
         _model_cache[default_model] = TextEmbedding(model_name=default_model)
         _current_model = default_model
-        desc = _model_cache[default_model].model_description
+        desc = _model_cache[default_model]
         elapsed = time.time() - start
-        log_info("Startup: default model loaded", model=default_model, dimensions=desc.dim, max_length=desc.max_length, elapsed_ms=int(elapsed*1000))
+        log_info("Startup: default model loaded", model=default_model, dimensions=desc.embedding_size, elapsed_ms=int(elapsed*1000))
         print(json.dumps({
             "event": "ready",
             "model": default_model,
-            "dimensions": desc.dim,
-            "max_length": desc.max_length,
+            "dimensions": desc.embedding_size,
             "cached": list(_model_cache.keys())
         }), flush=True)
     except Exception as e:
