@@ -73,6 +73,29 @@ type ShowRequest struct {
 	Name string `json:"name"`
 }
 
+// Chroma types
+type ChromaCreateRequest struct {
+	Name      string `json:"name"`
+	Dimension int    `json:"dimension"`
+	Metric    string `json:"metric"`
+}
+
+type ChromaAddRequest struct {
+	IDs        []string                 `json:"ids"`
+	Embeddings [][]float32               `json:"embeddings"`
+	Metadatas  []map[string]interface{} `json:"metadatas,omitempty"`
+}
+
+type ChromaQueryRequest struct {
+	QueryEmbeddings [][]float32 `json:"query_embeddings"`
+	NResults        int          `json:"n_results"`
+	Include         []string     `json:"include,omitempty"`
+}
+
+type ChromaDeleteRequest struct {
+	IDs []string `json:"ids,omitempty"`
+}
+
 func getEnv(key, defaultVal string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -242,14 +265,20 @@ func getExeDir() string {
 	return "."
 }
 
-func pythonCall(ctx context.Context, req PyRequest) (*PyResponse, error) {
+func pythonCall(ctx context.Context, req interface{}) (*PyResponse, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
+	// Extract command for logging
+	cmd := ""
+	if m, ok := req.(map[string]interface{}); ok {
+		cmd, _ = m["command"].(string)
+	}
+
 	reqID := atomic.AddUint64(&requestCounter, 1)
-	debugf("pythonCall START", "req_id", reqID, "command", req.Command, "model_name", req.ModelName)
+	debugf("pythonCall START", "req_id", reqID, "command", cmd)
 
 	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
@@ -279,7 +308,11 @@ func pythonCall(ctx context.Context, req PyRequest) (*PyResponse, error) {
 		}
 		var resp PyResponse
 		if err := json.Unmarshal([]byte(line), &resp); err != nil {
-			errCh <- fmt.Errorf("decode python response: %w (line: %s)", err, line[:min(len(line), 100)])
+			previewLen := len(line)
+			if previewLen > 100 {
+				previewLen = 100
+			}
+			errCh <- fmt.Errorf("decode python response: %w (line: %s)", err, line[:previewLen])
 			return
 		}
 		respCh <- &resp
@@ -287,7 +320,7 @@ func pythonCall(ctx context.Context, req PyRequest) (*PyResponse, error) {
 
 	select {
 	case <-ctx.Done():
-		errorf("pythonCall TIMEOUT", "req_id", reqID, "command", req.Command, "model_name", req.ModelName)
+		errorf("pythonCall TIMEOUT", "req_id", reqID, "command", cmd)
 		return nil, ctx.Err()
 	case err := <-errCh:
 		errorf("pythonCall READ ERROR", "req_id", reqID, "err", err)
@@ -593,6 +626,251 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"status": "success", "model": resp.Model})
 }
 
+// Chroma handlers
+
+func collectionsHandler(w http.ResponseWriter, r *http.Request) {
+	reqID := atomic.AddUint64(&requestCounter, 1)
+	start := time.Now()
+
+	debugf("collectionsHandler START", "req_id", reqID, "method", r.Method)
+
+	if r.Method == http.MethodGet {
+		// List collections
+		resp, err := pythonCall(r.Context(), map[string]interface{}{"command": "chroma_list"})
+		if err != nil {
+			errorf("collectionsHandler GET FAILED", "req_id", reqID, "err", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		debugf("collectionsHandler GET OK", "req_id", reqID, "elapsed", time.Since(start).String())
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	if r.Method == http.MethodPost {
+		// Create collection
+		var req ChromaCreateRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			errorf("collectionsHandler POST bad request", "req_id", reqID, "err", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.Name == "" {
+			http.Error(w, "collection name is required", http.StatusBadRequest)
+			return
+		}
+		dimension := req.Dimension
+		if dimension == 0 {
+			dimension = 768
+		}
+		metric := req.Metric
+		if metric == "" {
+			metric = "cosine"
+		}
+		resp, err := pythonCall(r.Context(), map[string]interface{}{
+			"command":   "chroma_create",
+			"name":      req.Name,
+			"dimension": dimension,
+			"metric":    metric,
+		})
+		if err != nil {
+			errorf("collectionsHandler POST FAILED", "req_id", reqID, "err", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		debugf("collectionsHandler POST OK", "req_id", reqID, "elapsed", time.Since(start).String())
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+}
+
+func collectionHandler(w http.ResponseWriter, r *http.Request) {
+	reqID := atomic.AddUint64(&requestCounter, 1)
+	start := time.Now()
+
+	// Extract collection name from URL: /collections/{name}
+	parts := strings.SplitN(r.URL.Path, "/", 4)
+	name := ""
+	if len(parts) >= 3 {
+		name = parts[2]
+	}
+
+	debugf("collectionHandler START", "req_id", reqID, "method", r.Method, "name", name)
+
+	if r.Method == http.MethodDelete {
+		resp, err := pythonCall(r.Context(), map[string]interface{}{
+			"command": "chroma_delete",
+			"name":    name,
+		})
+		if err != nil {
+			errorf("collectionHandler DELETE FAILED", "req_id", reqID, "err", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		debugf("collectionHandler DELETE OK", "req_id", reqID, "elapsed", time.Since(start).String())
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+}
+
+func collectionVectorsHandler(w http.ResponseWriter, r *http.Request) {
+	reqID := atomic.AddUint64(&requestCounter, 1)
+	start := time.Now()
+
+	// Extract collection name from URL: /collections/{name}/vectors
+	parts := strings.SplitN(r.URL.Path, "/", 5)
+	name := ""
+	if len(parts) >= 4 {
+		name = parts[2]
+	}
+
+	debugf("collectionVectorsHandler START", "req_id", reqID, "method", r.Method, "name", name)
+
+	if r.Method == http.MethodPost {
+		// Add vectors
+		var req ChromaAddRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			errorf("collectionVectorsHandler POST bad request", "req_id", reqID, "err", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		resp, err := pythonCall(r.Context(), map[string]interface{}{
+			"command":    "chroma_add",
+			"name":       name,
+			"ids":        req.IDs,
+			"embeddings": req.Embeddings,
+			"metadatas":  req.Metadatas,
+		})
+		if err != nil {
+			errorf("collectionVectorsHandler POST FAILED", "req_id", reqID, "err", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		debugf("collectionVectorsHandler POST OK", "req_id", reqID, "elapsed", time.Since(start).String())
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	if r.Method == http.MethodDelete {
+		// Delete vectors
+		var req ChromaDeleteRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			errorf("collectionVectorsHandler DELETE bad request", "req_id", reqID, "err", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		resp, err := pythonCall(r.Context(), map[string]interface{}{
+			"command": "chroma_delete",
+			"name":    name,
+			"ids":     req.IDs,
+		})
+		if err != nil {
+			errorf("collectionVectorsHandler DELETE FAILED", "req_id", reqID, "err", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		debugf("collectionVectorsHandler DELETE OK", "req_id", reqID, "elapsed", time.Since(start).String())
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+}
+
+func collectionQueryHandler(w http.ResponseWriter, r *http.Request) {
+	reqID := atomic.AddUint64(&requestCounter, 1)
+	start := time.Now()
+
+	// Extract collection name from URL: /collections/{name}/query
+	parts := strings.SplitN(r.URL.Path, "/", 5)
+	name := ""
+	if len(parts) >= 4 {
+		name = parts[2]
+	}
+
+	debugf("collectionQueryHandler START", "req_id", reqID, "method", r.Method, "name", name)
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req ChromaQueryRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		errorf("collectionQueryHandler bad request", "req_id", reqID, "err", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	nResults := req.NResults
+	if nResults == 0 {
+		nResults = 10
+	}
+	include := req.Include
+	if include == nil {
+		include = []string{"metadatas", "distances"}
+	}
+
+	resp, err := pythonCall(r.Context(), map[string]interface{}{
+		"command":          "chroma_query",
+		"name":             name,
+		"query_embeddings": req.QueryEmbeddings,
+		"n_results":       nResults,
+		"include":          include,
+	})
+	if err != nil {
+		errorf("collectionQueryHandler FAILED", "req_id", reqID, "err", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	debugf("collectionQueryHandler OK", "req_id", reqID, "elapsed", time.Since(start).String())
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func collectionResetHandler(w http.ResponseWriter, r *http.Request) {
+	reqID := atomic.AddUint64(&requestCounter, 1)
+	start := time.Now()
+
+	// Extract collection name from URL: /collections/{name}/reset
+	parts := strings.SplitN(r.URL.Path, "/", 5)
+	name := ""
+	if len(parts) >= 4 {
+		name = parts[2]
+	}
+
+	debugf("collectionResetHandler START", "req_id", reqID, "method", r.Method, "name", name)
+
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	resp, err := pythonCall(r.Context(), map[string]interface{}{
+		"command": "chroma_reset",
+		"name":    name,
+	})
+	if err != nil {
+		errorf("collectionResetHandler FAILED", "req_id", reqID, "err", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	debugf("collectionResetHandler OK", "req_id", reqID, "elapsed", time.Since(start).String())
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
 func main() {
 	embedxPort = getEnvInt("EMBEDX_PORT", 11434)
 
@@ -626,6 +904,21 @@ func main() {
 	mux.HandleFunc("/api/tags", withRecover(modelsHandler))
 	mux.HandleFunc("/models", withRecover(modelsHandler))
 	mux.HandleFunc("/health", withRecover(healthHandler))
+
+	// Chroma vector store routes
+	mux.HandleFunc("/collections", withRecover(collectionsHandler))
+	mux.HandleFunc("/collections/", func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if strings.HasSuffix(path, "/vectors") {
+			collectionVectorsHandler(w, r)
+		} else if strings.HasSuffix(path, "/query") {
+			collectionQueryHandler(w, r)
+		} else if strings.HasSuffix(path, "/reset") {
+			collectionResetHandler(w, r)
+		} else {
+			collectionHandler(w, r)
+		}
+	})
 
 	addr := fmt.Sprintf("0.0.0.0:%d", embedxPort)
 	infof("embedx server starting", "addr", addr)

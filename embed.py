@@ -6,6 +6,7 @@ Supports:
 - Pull (pre-download) models
 - List cached models
 - Hot-switch model via protocol
+- Chroma vector store (collections, add, query, delete)
 """
 
 import sys
@@ -18,6 +19,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import chromadb
+from chromadb.config import Settings
 from fastembed import TextEmbedding
 
 # Default cache directory (FastEmbed default)
@@ -52,6 +55,139 @@ def log_traceback(exc: Exception, context: str = ""):
 _model_cache: dict[str, TextEmbedding] = {}
 _current_model: Optional[str] = None
 _cache_lock = threading.Lock()
+
+# Chroma client (persistent)
+_chroma_client: Optional[chromadb.PersistentClient] = None
+_chroma_lock = threading.Lock()
+
+
+def get_chroma_client() -> chromadb.PersistentClient:
+    """Get or create Chroma client."""
+    global _chroma_client
+    if _chroma_client is None:
+        with _chroma_lock:
+            if _chroma_client is None:
+                chroma_dir = os.path.expanduser("~/.embedx/chroma")
+                os.makedirs(chroma_dir, exist_ok=True)
+                _chroma_client = chromadb.PersistentClient(path=chroma_dir)
+                log_info("Chroma client initialized", path=chroma_dir)
+    return _chroma_client
+
+
+def chroma_create(name: str, dimension: int = 768, metric: str = "cosine"):
+    """Create a Chroma collection."""
+    log_info("chroma_create", name=name, dimension=dimension, metric=metric)
+    client = get_chroma_client()
+    try:
+        collection = client.get_or_create_collection(
+            name=name,
+            metadata={"dimension": dimension, "metric": metric}
+        )
+        count = collection.count()
+        log_info("chroma_create done", name=name, count=count)
+        return {"status": "created", "name": name, "count": count}
+    except Exception as e:
+        log_traceback(e, f"chroma_create {name}")
+        return {"status": "error", "error": str(e)}
+
+
+def chroma_list():
+    """List all Chroma collections."""
+    log_info("chroma_list")
+    client = get_chroma_client()
+    try:
+        collections = client.list_collections()
+        result = [{"name": c.name, "metadata": c.metadata} for c in collections]
+        log_info("chroma_list done", count=len(result))
+        return {"status": "ok", "collections": result}
+    except Exception as e:
+        log_traceback(e, "chroma_list")
+        return {"status": "error", "error": str(e)}
+
+
+def chroma_delete(name: str):
+    """Delete a Chroma collection."""
+    log_info("chroma_delete", name=name)
+    client = get_chroma_client()
+    try:
+        client.delete_collection(name)
+        log_info("chroma_delete done", name=name)
+        return {"status": "deleted", "name": name}
+    except Exception as e:
+        log_traceback(e, f"chroma_delete {name}")
+        return {"status": "error", "error": str(e)}
+
+
+def chroma_add(name: str, ids: list[str], embeddings: list[list[float]], metadatas: Optional[list[dict]] = None):
+    """Add vectors to a Chroma collection."""
+    log_info("chroma_add", name=name, count=len(ids))
+    client = get_chroma_client()
+    try:
+        collection = client.get_or_create_collection(name=name)
+        collection.add(
+            ids=ids,
+            embeddings=embeddings,
+            metadatas=metadatas or [{} for _ in ids]
+        )
+        count = collection.count()
+        log_info("chroma_add done", name=name, total_count=count)
+        return {"status": "added", "name": name, "count": len(ids), "total": count}
+    except Exception as e:
+        log_traceback(e, f"chroma_add {name}")
+        return {"status": "error", "error": str(e)}
+
+
+def chroma_query(name: str, query_embeddings: list[list[float]], n_results: int = 10, include: Optional[list[str]] = None):
+    """Query similar vectors from a Chroma collection."""
+    log_info("chroma_query", name=name, n_results=n_results, query_count=len(query_embeddings))
+    client = get_chroma_client()
+    try:
+        collection = client.get_or_create_collection(name=name)
+        results = collection.query(
+            query_embeddings=query_embeddings,
+            n_results=n_results,
+            include=include or ["metadatas", "distances"]
+        )
+        log_info("chroma_query done", name=name, result_ids=len(results.get("ids", [[]])[0]))
+        return {
+            "status": "ok",
+            "ids": results.get("ids", []),
+            "distances": results.get("distances", []),
+            "metadatas": results.get("metadatas", []),
+            "embeddings": results.get("embeddings", [])
+        }
+    except Exception as e:
+        log_traceback(e, f"chroma_query {name}")
+        return {"status": "error", "error": str(e)}
+
+
+def chroma_delete_vectors(name: str, ids: list[str]):
+    """Delete vectors from a Chroma collection."""
+    log_info("chroma_delete_vectors", name=name, count=len(ids))
+    client = get_chroma_client()
+    try:
+        collection = client.get_or_create_collection(name=name)
+        collection.delete(ids=ids)
+        count = collection.count()
+        log_info("chroma_delete_vectors done", name=name, remaining=count)
+        return {"status": "deleted", "name": name, "count": len(ids), "remaining": count}
+    except Exception as e:
+        log_traceback(e, f"chroma_delete_vectors {name}")
+        return {"status": "error", "error": str(e)}
+
+
+def chroma_reset(name: str):
+    """Reset (clear) a Chroma collection."""
+    log_info("chroma_reset", name=name)
+    client = get_chroma_client()
+    try:
+        collection = client.get_or_create_collection(name=name)
+        collection.delete(where={})  # Delete all
+        log_info("chroma_reset done", name=name)
+        return {"status": "reset", "name": name}
+    except Exception as e:
+        log_traceback(e, f"chroma_reset {name}")
+        return {"status": "error", "error": str(e)}
 
 
 def setup_proxy():
@@ -224,6 +360,46 @@ def handle_command(data: dict) -> dict:
             log_debug("embed request", num_texts=len(texts), model_name=model_name)
             embeddings = embed(texts, model_name)
             return {"type": "embed_done", "embeddings": embeddings}
+
+        # Chroma commands
+        elif cmd == "chroma_create":
+            name = data.get("name", "default")
+            dimension = data.get("dimension", 768)
+            metric = data.get("metric", "cosine")
+            return chroma_create(name, dimension, metric)
+
+        elif cmd == "chroma_list":
+            return chroma_list()
+
+        elif cmd == "chroma_delete":
+            name = data.get("name", "default")
+            return chroma_delete(name)
+
+        elif cmd == "chroma_add":
+            name = data.get("name", "default")
+            ids = data.get("ids", [])
+            embeddings = data.get("embeddings", [])
+            metadatas = data.get("metadatas")
+            return chroma_add(name, ids, embeddings, metadatas)
+
+        elif cmd == "chroma_query":
+            name = data.get("name", "default")
+            query_embeddings = data.get("query_embeddings", [])
+            n_results = data.get("n_results", 10)
+            include = data.get("include")
+            return chroma_query(name, query_embeddings, n_results, include)
+
+        elif cmd == "chroma_delete":
+            name = data.get("name", "default")
+            ids = data.get("ids")
+            if ids:
+                return chroma_delete_vectors(name, ids)
+            else:
+                return chroma_delete(name)
+
+        elif cmd == "chroma_reset":
+            name = data.get("name", "default")
+            return chroma_reset(name)
 
         else:
             log_warn("Unknown command", cmd=cmd)
