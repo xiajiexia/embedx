@@ -131,9 +131,36 @@ func debugf(msg string, kv ...interface{}) {
 	}
 }
 
-func startPythonBackend() error {
-	infof("Starting Python backend", "model", defaultModel, "exe_dir", getExeDir())
+// ensurePythonRunning checks if the Python backend is alive and restarts it if not.
+// Called at the start of each pythonCall for automatic crash recovery.
+func ensurePythonRunning() error {
+	mu.Lock()
+	defer mu.Unlock()
+	if atomic.LoadInt32(&pythonAlive) == 1 {
+		return nil
+	}
+	infof("Python backend dead, restarting...")
+	if err := startPythonBackendLocked(); err != nil {
+		return fmt.Errorf("restart python backend: %w", err)
+	}
+	return nil
+}
 
+func startPythonBackend() error {
+	mu.Lock()
+	defer mu.Unlock()
+	return startPythonBackendLocked()
+}
+
+// startPythonBackendLocked starts or restarts the Python backend. Caller must hold mu.
+func startPythonBackendLocked() error {
+	// Clean up any stale process
+	if pythonProcess != nil && pythonProcess.Process != nil {
+		pythonProcess.Process.Kill()
+		pythonProcess.Wait()
+	}
+
+	infof("Starting Python backend", "model", defaultModel, "exe_dir", getExeDir())
 	pythonProcess = exec.Command("python3", "-u", "embed.py", defaultModel)
 
 	if dir := getExeDir(); dir != "." {
@@ -164,27 +191,28 @@ func startPythonBackend() error {
 	if err != nil {
 		return fmt.Errorf("create stdout pipe: %w", err)
 	}
-	// Keep raw file reference for SetReadDeadline
 	if f, ok := stdout.(*os.File); ok {
 		pythonFile = f
 	}
-	pythonStdout = bufio.NewReader(stdout)
+	// Use 256KB buffer to prevent bufio panic when Python outputs large blocks (Go 1.26)
+	pythonStdout = bufio.NewReaderSize(stdout, 256*1024)
 
 	if err := pythonProcess.Start(); err != nil {
 		return fmt.Errorf("start python: %w", err)
 	}
-
 	infof("Python process started", "pid", pythonProcess.Process.Pid)
 	atomic.StoreInt32(&pythonAlive, 1)
 
 	go func() {
 		defer recoverPanic("pythonProcess.Wait")
 		err := pythonProcess.Wait()
-		atomic.StoreInt32(&pythonAlive, 0)
-		if err != nil {
-			errorf("Python process exited with error", "err", err)
-		} else {
-			infof("Python process exited normally")
+		// Log once when transitioning alive -> dead (SwapInt32 prevents duplicate logs)
+		if atomic.SwapInt32(&pythonAlive, 0) == 1 {
+			if err != nil {
+				errorf("Python process exited with error", "err", err)
+			} else {
+				infof("Python process exited normally")
+			}
 		}
 	}()
 
@@ -228,6 +256,7 @@ func startPythonBackend() error {
 
 	return nil
 }
+
 
 // readLineWithTimeout reads a newline-delimited line with a timeout
 func readLineWithTimeout(timeout time.Duration) (string, error) {
@@ -283,12 +312,13 @@ func pythonCall(ctx context.Context, req interface{}) (*PyResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 
-	mu.Lock()
-	if atomic.LoadInt32(&pythonAlive) == 0 {
-		mu.Unlock()
-		errorf("pythonCall: python process dead", "req_id", reqID)
-		return nil, fmt.Errorf("python process is not running")
+	// Auto-restart Python backend if it has crashed
+	if err := ensurePythonRunning(); err != nil {
+		errorf("pythonCall: cannot restart python backend", "req_id", reqID, "err", err)
+		return nil, fmt.Errorf("python backend unavailable: %w", err)
 	}
+
+	mu.Lock()
 	if _, err := fmt.Fprintf(pythonStdin, "%s\n", body); err != nil {
 		mu.Unlock()
 		errorf("pythonCall: write failed", "req_id", reqID, "err", err)
@@ -419,9 +449,9 @@ func embedHandler(w http.ResponseWriter, r *http.Request) {
 		modelName = defaultModel
 	}
 
-	if atomic.LoadInt32(&pythonAlive) == 0 {
-		errorf("embedHandler python dead", "req_id", reqID)
-		http.Error(w, "python backend not running", http.StatusInternalServerError)
+	if err := ensurePythonRunning(); err != nil {
+		errorf("embedHandler python unavailable", "req_id", reqID, "err", err)
+		http.Error(w, "python backend unavailable: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
