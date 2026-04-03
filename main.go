@@ -37,13 +37,13 @@ var (
 )
 
 // restartCh signals that Python backend needs to restart. Buffered so non-blocking.
-// readyCh is closed when Python is fully ready (ready event received).
-var restartCh = make(chan struct{}, 1)
-var readyCh   = make(chan struct{})
+var restartCh  = make(chan struct{}, 1)
+var pythonCond = sync.NewCond(&mu)
+var pythonReady = true  // Python starts alive (set by main before spawning goroutines)
 
 // ensurePythonRunning ensures the Python backend is fully ready before any request writes to it.
-// All requests wait on the same restart goroutine, guaranteeing no request proceeds until
-// Python has emitted the "ready" event — eliminating the race where pythonAlive=1 but not ready.
+// All requests wait on the same restart goroutine via pythonCond, guaranteeing no request proceeds
+// until Python has emitted the "ready" event — eliminating the race where pythonAlive=1 but not ready.
 func ensurePythonRunning() error {
 	mu.Lock()
 	if atomic.LoadInt32(&pythonAlive) == 1 {
@@ -55,10 +55,12 @@ func ensurePythonRunning() error {
 	case restartCh <- struct{}{}:
 	default:
 	}
+	// Wait until pythonReady==true (set by restart goroutine after "ready" event).
+	// Cond.Wait() unlocks mu atomically, so restartGoroutine can acquire it.
+	for !pythonReady {
+		pythonCond.Wait()
+	}
 	mu.Unlock()
-
-	// Wait for restart goroutine to complete startup and close readyCh.
-	<-readyCh
 	return nil
 }
 
@@ -71,16 +73,18 @@ func restartGoroutine() {
 		infof("Python backend dead, restarting...")
 		if err := startPythonBackendLocked(); err != nil {
 			errorf("restart python backend failed", "err", err)
-			// Keep pythonAlive=0 so next request retries; close readyCh so blocked callers don't hang forever
-			close(readyCh)
-			readyCh = make(chan struct{})
+			// Keep pythonAlive=0 so next request retries; Broadcast so blocked callers
+			// re-check the loop and either retry (if pythonAlive==0 triggers another restart)
+			// or give up. They will return nil on pythonAlive==1.
+			pythonCond.Broadcast()
 			mu.Unlock()
 			continue
 		}
+		// pythonAlive=1 is set inside startPythonBackendLocked after the ready event.
+		// Now wake all blocked callers.
+		pythonReady = true
+		pythonCond.Broadcast()
 		mu.Unlock()
-		// Signal all blocked callers that Python is ready
-		close(readyCh)
-		readyCh = make(chan struct{})
 	}
 }
 
@@ -193,6 +197,8 @@ func startPythonBackendLocked() error {
 		pythonProcess.Process.Kill()
 		pythonProcess.Wait()
 	}
+	// Mark not-ready so any goroutines woken by a prior crash广播 re-check and wait for us
+	pythonReady = false
 
 	infof("Starting Python backend", "model", defaultModel, "exe_dir", getExeDir())
 	pythonProcess = exec.Command("python3", "-u", "embed.py", defaultModel)
