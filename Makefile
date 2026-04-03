@@ -40,30 +40,28 @@ install: build
 	sudo cp embedx /opt/embedx/
 	sudo cp embed.py /opt/embedx/
 	sudo chmod +x /opt/embedx/embedx
-
-	sudo tee /etc/systemd/system/embedx.service > /dev/null <<EOF
-[Unit]
-Description=embedx - FastEmbed with Ollama-compatible API
-After=network.target
-
-[Service]
-Type=simple
-User=$$USER
-WorkingDirectory=/opt/embedx
-ExecStart=/opt/embedx/embedx
-Restart=always
-RestartSec=5
-Environment=EMBEDX_PORT=11434
-Environment=EMBEDX_MODEL=BAAI/bge-small-zh-v1.5
-Environment=HTTP_PROXY=http://127.0.0.1:1087
-Environment=HTTPS_PROXY=http://127.0.0.1:1087
-Environment=NO_PROXY=localhost,127.0.0.1
-Environment=HF_HUB_CACHE=/opt/embedx/models
-Environment=TRANSFORMERS_CACHE=/opt/embedx/models
-
-[Install]
-WantedBy=multi-user.target
-EOF
+	printf '%s\n' \
+		'[Unit]' \
+		'Description=embedx - FastEmbed with Ollama-compatible API' \
+		'After=network.target' \
+		'' \
+		'[Service]' \
+		'Type=simple' \
+		'User=$(shell whoami)' \
+		'WorkingDirectory=/opt/embedx' \
+		'ExecStart=/opt/embedx/embedx' \
+		'Restart=always' \
+		'RestartSec=5' \
+		'Environment=EMBEDX_PORT=11434' \
+		'Environment=EMBEDX_MODEL=BAAI/bge-small-zh-v1.5' \
+		'Environment=HTTP_PROXY=http://127.0.0.1:1087' \
+		'Environment=HTTPS_PROXY=http://127.0.0.1:1087' \
+		'Environment=NO_PROXY=localhost,127.0.0.1' \
+		'Environment=HF_HUB_CACHE=/opt/embedx/models' \
+		'Environment=TRANSFORMERS_CACHE=/opt/embedx/models' \
+		'' \
+		'[Install]' \
+		'WantedBy=multi-user.target' | sudo tee /etc/systemd/system/embedx.service > /dev/null
 	sudo systemctl daemon-reload
 	sudo systemctl enable embedx
 

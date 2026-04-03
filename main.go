@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -34,6 +35,62 @@ var (
 	mu            sync.Mutex
 	pythonAlive   int32 = 1
 )
+
+// pythonReqMu serialises all requests to the Python subprocess — only one request
+// can be in-flight at a time because stdin/stdout are a single sequential channel.
+var pythonReqMu sync.Mutex
+
+// restartCh signals that Python backend needs to restart. Buffered so non-blocking.
+var restartCh  = make(chan struct{}, 1)
+var pythonCond = sync.NewCond(&mu)
+var pythonReady = true  // Python starts alive (set by main before spawning goroutines)
+
+// ensurePythonRunning ensures the Python backend is fully ready before any request writes to it.
+// All requests wait on the same restart goroutine via pythonCond, guaranteeing no request proceeds
+// until Python has emitted the "ready" event — eliminating the race where pythonAlive=1 but not ready.
+func ensurePythonRunning() error {
+	mu.Lock()
+	if atomic.LoadInt32(&pythonAlive) == 1 {
+		mu.Unlock()
+		return nil
+	}
+	// Signal restart goroutine to start Python. Non-blocking send (buffered channel).
+	select {
+	case restartCh <- struct{}{}:
+	default:
+	}
+	// Wait until pythonReady==true (set by restart goroutine after "ready" event).
+	// Cond.Wait() unlocks mu atomically, so restartGoroutine can acquire it.
+	for !pythonReady {
+		pythonCond.Wait()
+	}
+	mu.Unlock()
+	return nil
+}
+
+// restartGoroutine runs for the lifetime of the process. It serialises all restart attempts
+// and guarantees Python is fully ready (ready event seen) before any request goroutine
+// is unblocked to write to stdin.
+func restartGoroutine() {
+	for range restartCh {
+		mu.Lock()
+		infof("Python backend dead, restarting...")
+		if err := startPythonBackendLocked(); err != nil {
+			errorf("restart python backend failed", "err", err)
+			// Keep pythonAlive=0 so next request retries; Broadcast so blocked callers
+			// re-check the loop and either retry (if pythonAlive==0 triggers another restart)
+			// or give up. They will return nil on pythonAlive==1.
+			pythonCond.Broadcast()
+			mu.Unlock()
+			continue
+		}
+		// pythonAlive=1 is set inside startPythonBackendLocked after the ready event.
+		// Now wake all blocked callers.
+		pythonReady = true
+		pythonCond.Broadcast()
+		mu.Unlock()
+	}
+}
 
 type PyRequest struct {
 	Command   string   `json:"command"`
@@ -132,8 +189,22 @@ func debugf(msg string, kv ...interface{}) {
 }
 
 func startPythonBackend() error {
-	infof("Starting Python backend", "model", defaultModel, "exe_dir", getExeDir())
+	mu.Lock()
+	defer mu.Unlock()
+	return startPythonBackendLocked()
+}
 
+// startPythonBackendLocked starts or restarts the Python backend. Caller must hold mu.
+func startPythonBackendLocked() error {
+	// Clean up any stale process
+	if pythonProcess != nil && pythonProcess.Process != nil {
+		pythonProcess.Process.Kill()
+		pythonProcess.Wait()
+	}
+	// Mark not-ready so any goroutines woken by a prior crash广播 re-check and wait for us
+	pythonReady = false
+
+	infof("Starting Python backend", "model", defaultModel, "exe_dir", getExeDir())
 	pythonProcess = exec.Command("python3", "-u", "embed.py", defaultModel)
 
 	if dir := getExeDir(); dir != "." {
@@ -164,27 +235,27 @@ func startPythonBackend() error {
 	if err != nil {
 		return fmt.Errorf("create stdout pipe: %w", err)
 	}
-	// Keep raw file reference for SetReadDeadline
 	if f, ok := stdout.(*os.File); ok {
 		pythonFile = f
 	}
-	pythonStdout = bufio.NewReader(stdout)
+	// Use 256KB buffer to prevent bufio panic when Python outputs large blocks (Go 1.26)
+	pythonStdout = bufio.NewReaderSize(stdout, 256*1024)
 
 	if err := pythonProcess.Start(); err != nil {
 		return fmt.Errorf("start python: %w", err)
 	}
-
 	infof("Python process started", "pid", pythonProcess.Process.Pid)
-	atomic.StoreInt32(&pythonAlive, 1)
 
 	go func() {
 		defer recoverPanic("pythonProcess.Wait")
 		err := pythonProcess.Wait()
-		atomic.StoreInt32(&pythonAlive, 0)
-		if err != nil {
-			errorf("Python process exited with error", "err", err)
-		} else {
-			infof("Python process exited normally")
+		// Log once when transitioning alive -> dead (SwapInt32 prevents duplicate logs)
+		if atomic.SwapInt32(&pythonAlive, 0) == 1 {
+			if err != nil {
+				errorf("Python process exited with error", "err", err)
+			} else {
+				infof("Python process exited normally")
+			}
 		}
 	}()
 
@@ -222,11 +293,32 @@ func startPythonBackend() error {
 			} else {
 				infof("Python backend ready", "model", resp.Model, "dimensions", resp.Dimensions, "max_length", resp.MaxLength, "cached", resp.Cached)
 			}
+			// Python is fully initialised — mark alive so new requests can proceed
+			atomic.StoreInt32(&pythonAlive, 1)
 			break
 		}
 	}
 
 	return nil
+}
+
+
+// readLineFromBufio reads a newline-delimited line from a bufio.Reader,
+// avoiding bufio.Reader's ReadString/ReadBytes which call collectFragments
+// and can panic with "slice bounds out of range" on certain large reads.
+func readLineFromBufio(br *bufio.Reader) (string, error) {
+	var buf bytes.Buffer
+	for {
+		b, err := br.ReadByte()
+		if err != nil {
+			return buf.String(), err
+		}
+		if b == '\n' {
+			buf.WriteByte('\n')
+			return buf.String(), nil
+		}
+		buf.WriteByte(b)
+	}
 }
 
 // readLineWithTimeout reads a newline-delimited line with a timeout
@@ -235,7 +327,7 @@ func readLineWithTimeout(timeout time.Duration) (string, error) {
 	errCh := make(chan error, 1)
 
 	go func() {
-		line, err := pythonStdout.ReadString('\n')
+		line, err := readLineFromBufio(pythonStdout)
 		if err != nil {
 			errCh <- err
 			return
@@ -283,25 +375,27 @@ func pythonCall(ctx context.Context, req interface{}) (*PyResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 
-	mu.Lock()
-	if atomic.LoadInt32(&pythonAlive) == 0 {
-		mu.Unlock()
-		errorf("pythonCall: python process dead", "req_id", reqID)
-		return nil, fmt.Errorf("python process is not running")
+	// Auto-restart Python backend if it has crashed
+	if err := ensurePythonRunning(); err != nil {
+		errorf("pythonCall: cannot restart python backend", "req_id", reqID, "err", err)
+		return nil, fmt.Errorf("python backend unavailable: %w", err)
 	}
+
+	// Serialise write+read so Python sees one JSON request at a time.
+	pythonReqMu.Lock()
 	if _, err := fmt.Fprintf(pythonStdin, "%s\n", body); err != nil {
-		mu.Unlock()
+		pythonReqMu.Unlock()
 		errorf("pythonCall: write failed", "req_id", reqID, "err", err)
 		return nil, fmt.Errorf("write to python: %w", err)
 	}
-	mu.Unlock()
 
 	respCh := make(chan *PyResponse, 1)
 	errCh := make(chan error, 1)
 
 	go func() {
-		defer recoverPanic("pythonCall ReadString")
-		line, err := pythonStdout.ReadString('\n')
+		defer recoverPanic("pythonCall readLine")
+		// pythonReqMu is held by parent; pythonStdout is only accessed here.
+		line, err := readLineFromBufio(pythonStdout)
 		if err != nil {
 			errCh <- err
 			return
@@ -320,13 +414,18 @@ func pythonCall(ctx context.Context, req interface{}) (*PyResponse, error) {
 
 	select {
 	case <-ctx.Done():
+		// Keep pythonReqMu locked on this goroutine; another request waiting
+		// on pythonReqMu will block, which is correct — Python is still busy.
 		errorf("pythonCall TIMEOUT", "req_id", reqID, "command", cmd)
+		pythonReqMu.Unlock()
 		return nil, ctx.Err()
 	case err := <-errCh:
 		errorf("pythonCall READ ERROR", "req_id", reqID, "err", err)
+		pythonReqMu.Unlock()
 		return nil, fmt.Errorf("read from python: %w", err)
 	case resp := <-respCh:
 		debugf("pythonCall DONE", "req_id", reqID, "resp_type", resp.Type, "resp_event", resp.Event, "resp_error", resp.Error)
+		pythonReqMu.Unlock()
 		return resp, nil
 	}
 }
@@ -419,9 +518,9 @@ func embedHandler(w http.ResponseWriter, r *http.Request) {
 		modelName = defaultModel
 	}
 
-	if atomic.LoadInt32(&pythonAlive) == 0 {
-		errorf("embedHandler python dead", "req_id", reqID)
-		http.Error(w, "python backend not running", http.StatusInternalServerError)
+	if err := ensurePythonRunning(); err != nil {
+		errorf("embedHandler python unavailable", "req_id", reqID, "err", err)
+		http.Error(w, "python backend unavailable: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -889,6 +988,8 @@ func main() {
 		errorf("startPythonBackend FAILED", "err", err)
 		log.Fatalf("Failed to start Python backend: %v", err)
 	}
+	// Single goroutine serialises all crash restarts; guarantees Python is ready before requests proceed
+	go restartGoroutine()
 	defer func() {
 		if pythonProcess != nil && pythonProcess.Process != nil {
 			infof("Killing python process", "pid", pythonProcess.Process.Pid)
