@@ -36,6 +36,10 @@ var (
 	pythonAlive   int32 = 1
 )
 
+// pythonReqMu serialises all requests to the Python subprocess — only one request
+// can be in-flight at a time because stdin/stdout are a single sequential channel.
+var pythonReqMu sync.Mutex
+
 // restartCh signals that Python backend needs to restart. Buffered so non-blocking.
 var restartCh  = make(chan struct{}, 1)
 var pythonCond = sync.NewCond(&mu)
@@ -377,19 +381,20 @@ func pythonCall(ctx context.Context, req interface{}) (*PyResponse, error) {
 		return nil, fmt.Errorf("python backend unavailable: %w", err)
 	}
 
-	mu.Lock()
+	// Serialise write+read so Python sees one JSON request at a time.
+	pythonReqMu.Lock()
 	if _, err := fmt.Fprintf(pythonStdin, "%s\n", body); err != nil {
-		mu.Unlock()
+		pythonReqMu.Unlock()
 		errorf("pythonCall: write failed", "req_id", reqID, "err", err)
 		return nil, fmt.Errorf("write to python: %w", err)
 	}
-	mu.Unlock()
 
 	respCh := make(chan *PyResponse, 1)
 	errCh := make(chan error, 1)
 
 	go func() {
 		defer recoverPanic("pythonCall readLine")
+		// pythonReqMu is held by parent; pythonStdout is only accessed here.
 		line, err := readLineFromBufio(pythonStdout)
 		if err != nil {
 			errCh <- err
@@ -409,13 +414,18 @@ func pythonCall(ctx context.Context, req interface{}) (*PyResponse, error) {
 
 	select {
 	case <-ctx.Done():
+		// Keep pythonReqMu locked on this goroutine; another request waiting
+		// on pythonReqMu will block, which is correct — Python is still busy.
 		errorf("pythonCall TIMEOUT", "req_id", reqID, "command", cmd)
+		pythonReqMu.Unlock()
 		return nil, ctx.Err()
 	case err := <-errCh:
 		errorf("pythonCall READ ERROR", "req_id", reqID, "err", err)
+		pythonReqMu.Unlock()
 		return nil, fmt.Errorf("read from python: %w", err)
 	case resp := <-respCh:
 		debugf("pythonCall DONE", "req_id", reqID, "resp_type", resp.Type, "resp_event", resp.Event, "resp_error", resp.Error)
+		pythonReqMu.Unlock()
 		return resp, nil
 	}
 }
