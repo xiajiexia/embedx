@@ -73,6 +73,10 @@ start:
 stop:
 	sudo systemctl stop embedx
 
+# Restart the service (SIGTERM → graceful drain → restart)
+restart:
+	sudo systemctl restart embedx
+
 # View logs
 logs:
 	sudo journalctl -u embedx -f
