@@ -11,12 +11,14 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -318,6 +320,42 @@ func readLineFromBufio(br *bufio.Reader) (string, error) {
 			return buf.String(), nil
 		}
 		buf.WriteByte(b)
+	}
+}
+
+// signalHandler listens for SIGTERM/SIGINT (graceful HTTP drain) and SIGUSR1 (Python backend restart).
+func signalHandler(server *http.Server) {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGUSR1)
+	for sig := range sigCh {
+		if sig == syscall.SIGUSR1 {
+			infof("Received SIGUSR1, restarting Python backend")
+			mu.Lock()
+			if atomic.LoadInt32(&pythonAlive) == 0 {
+				infof("Python backend already restarting")
+				mu.Unlock()
+				continue
+			}
+			atomic.StoreInt32(&pythonAlive, 0)
+			pythonReady = false
+			select {
+			case restartCh <- struct{}{}:
+			default:
+			}
+			mu.Unlock()
+			infof("Python backend restart signalled")
+			continue
+		}
+		// SIGTERM / SIGINT: graceful HTTP server shutdown
+		infof("Received %s, graceful shutdown开始了", sig)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			errorf("Graceful shutdown error", "err", err)
+		} else {
+			infof("Graceful shutdown完成，所有请求已 drain")
+		}
+		return
 	}
 }
 
@@ -1032,7 +1070,9 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	if err := server.ListenAndServe(); err != nil {
+	go signalHandler(server)
+
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		errorf("Server.ListenAndServe error", "err", err)
 		log.Fatalf("Server error: %v", err)
 	}
