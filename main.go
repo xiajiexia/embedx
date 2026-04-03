@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -292,13 +293,31 @@ func startPythonBackendLocked() error {
 }
 
 
+// readLineFromBufio reads a newline-delimited line from a bufio.Reader,
+// avoiding bufio.Reader's ReadString/ReadBytes which call collectFragments
+// and can panic with "slice bounds out of range" on certain large reads.
+func readLineFromBufio(br *bufio.Reader) (string, error) {
+	var buf bytes.Buffer
+	for {
+		b, err := br.ReadByte()
+		if err != nil {
+			return buf.String(), err
+		}
+		if b == '\n' {
+			buf.WriteByte('\n')
+			return buf.String(), nil
+		}
+		buf.WriteByte(b)
+	}
+}
+
 // readLineWithTimeout reads a newline-delimited line with a timeout
 func readLineWithTimeout(timeout time.Duration) (string, error) {
 	lineCh := make(chan string, 1)
 	errCh := make(chan error, 1)
 
 	go func() {
-		line, err := pythonStdout.ReadString('\n')
+		line, err := readLineFromBufio(pythonStdout)
 		if err != nil {
 			errCh <- err
 			return
@@ -364,8 +383,8 @@ func pythonCall(ctx context.Context, req interface{}) (*PyResponse, error) {
 	errCh := make(chan error, 1)
 
 	go func() {
-		defer recoverPanic("pythonCall ReadString")
-		line, err := pythonStdout.ReadString('\n')
+		defer recoverPanic("pythonCall readLine")
+		line, err := readLineFromBufio(pythonStdout)
 		if err != nil {
 			errCh <- err
 			return
