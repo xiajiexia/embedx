@@ -347,14 +347,15 @@ func signalHandler(server *http.Server) {
 			continue
 		}
 		// SIGTERM / SIGINT: graceful HTTP server shutdown
-		infof("Received %s, graceful shutdown开始了", sig)
+		infof("Received %s, graceful shutdown starting", sig)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
 		if err := server.Shutdown(ctx); err != nil {
 			errorf("Graceful shutdown error", "err", err)
 		} else {
-			infof("Graceful shutdown完成，所有请求已 drain")
+			infof("Graceful shutdown complete, all requests drained")
 		}
+		cancel()
+		signal.Stop(sigCh)
 		return
 	}
 }
