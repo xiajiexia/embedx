@@ -35,6 +35,54 @@ var (
 	pythonAlive   int32 = 1
 )
 
+// restartCh signals that Python backend needs to restart. Buffered so non-blocking.
+// readyCh is closed when Python is fully ready (ready event received).
+var restartCh = make(chan struct{}, 1)
+var readyCh   = make(chan struct{})
+
+// ensurePythonRunning ensures the Python backend is fully ready before any request writes to it.
+// All requests wait on the same restart goroutine, guaranteeing no request proceeds until
+// Python has emitted the "ready" event — eliminating the race where pythonAlive=1 but not ready.
+func ensurePythonRunning() error {
+	mu.Lock()
+	if atomic.LoadInt32(&pythonAlive) == 1 {
+		mu.Unlock()
+		return nil
+	}
+	// Signal restart goroutine to start Python. Non-blocking send (buffered channel).
+	select {
+	case restartCh <- struct{}{}:
+	default:
+	}
+	mu.Unlock()
+
+	// Wait for restart goroutine to complete startup and close readyCh.
+	<-readyCh
+	return nil
+}
+
+// restartGoroutine runs for the lifetime of the process. It serialises all restart attempts
+// and guarantees Python is fully ready (ready event seen) before any request goroutine
+// is unblocked to write to stdin.
+func restartGoroutine() {
+	for range restartCh {
+		mu.Lock()
+		infof("Python backend dead, restarting...")
+		if err := startPythonBackendLocked(); err != nil {
+			errorf("restart python backend failed", "err", err)
+			// Keep pythonAlive=0 so next request retries; close readyCh so blocked callers don't hang forever
+			close(readyCh)
+			readyCh = make(chan struct{})
+			mu.Unlock()
+			continue
+		}
+		mu.Unlock()
+		// Signal all blocked callers that Python is ready
+		close(readyCh)
+		readyCh = make(chan struct{})
+	}
+}
+
 type PyRequest struct {
 	Command   string   `json:"command"`
 	Model     string   `json:"model,omitempty"`
@@ -131,21 +179,6 @@ func debugf(msg string, kv ...interface{}) {
 	}
 }
 
-// ensurePythonRunning checks if the Python backend is alive and restarts it if not.
-// Called at the start of each pythonCall for automatic crash recovery.
-func ensurePythonRunning() error {
-	mu.Lock()
-	defer mu.Unlock()
-	if atomic.LoadInt32(&pythonAlive) == 1 {
-		return nil
-	}
-	infof("Python backend dead, restarting...")
-	if err := startPythonBackendLocked(); err != nil {
-		return fmt.Errorf("restart python backend: %w", err)
-	}
-	return nil
-}
-
 func startPythonBackend() error {
 	mu.Lock()
 	defer mu.Unlock()
@@ -201,7 +234,6 @@ func startPythonBackendLocked() error {
 		return fmt.Errorf("start python: %w", err)
 	}
 	infof("Python process started", "pid", pythonProcess.Process.Pid)
-	atomic.StoreInt32(&pythonAlive, 1)
 
 	go func() {
 		defer recoverPanic("pythonProcess.Wait")
@@ -250,6 +282,8 @@ func startPythonBackendLocked() error {
 			} else {
 				infof("Python backend ready", "model", resp.Model, "dimensions", resp.Dimensions, "max_length", resp.MaxLength, "cached", resp.Cached)
 			}
+			// Python is fully initialised — mark alive so new requests can proceed
+			atomic.StoreInt32(&pythonAlive, 1)
 			break
 		}
 	}
@@ -919,6 +953,8 @@ func main() {
 		errorf("startPythonBackend FAILED", "err", err)
 		log.Fatalf("Failed to start Python backend: %v", err)
 	}
+	// Single goroutine serialises all crash restarts; guarantees Python is ready before requests proceed
+	go restartGoroutine()
 	defer func() {
 		if pythonProcess != nil && pythonProcess.Process != nil {
 			infof("Killing python process", "pid", pythonProcess.Process.Pid)
