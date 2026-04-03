@@ -9,9 +9,9 @@ Supports:
 - Chroma vector store (collections, add, query, delete)
 """
 
+import os
 import sys
 import json
-import os
 import shutil
 import traceback
 import threading
@@ -22,6 +22,13 @@ from typing import Optional
 import chromadb
 from chromadb.config import Settings
 from fastembed import TextEmbedding
+
+# Use local ./models directory as HuggingFace cache (set by service env or defaults)
+# This avoids repeated downloads and ensures offline capability after first load
+if "HF_HUB_CACHE" not in os.environ:
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    os.environ["HF_HUB_CACHE"] = os.path.join(_script_dir, "models")
+os.environ.setdefault("TRANSFORMERS_CACHE", os.environ["HF_HUB_CACHE"])
 
 # Default cache directory (FastEmbed default)
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "fastembed"
