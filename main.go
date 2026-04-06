@@ -264,11 +264,18 @@ func startPythonBackendLocked() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
+	maxConsecutiveTimeouts := 3
+	consecutiveTimeouts := 0
 	for attempt := 1; ; attempt++ {
 		line, err := readLineWithTimeout(30 * time.Second)
 		if err != nil {
 			if err == context.DeadlineExceeded {
-				errorf("Timeout reading python stdout", "attempt", attempt, "timeout", "30s")
+				consecutiveTimeouts++
+				errorf("Timeout reading python stdout", "attempt", attempt, "timeout", "30s", "consecutive", consecutiveTimeouts)
+				if consecutiveTimeouts >= maxConsecutiveTimeouts {
+					errorf("Too many consecutive timeouts, giving up", "count", consecutiveTimeouts)
+					return fmt.Errorf("python backend timed out %d times, restarting", consecutiveTimeouts)
+				}
 				continue
 			}
 			if ctx.Err() != nil {
@@ -297,6 +304,11 @@ func startPythonBackendLocked() error {
 			}
 			// Python is fully initialised — mark alive so new requests can proceed
 			atomic.StoreInt32(&pythonAlive, 1)
+			break
+		}
+		if resp.Event == "error" {
+			errorf("Python backend error on startup", "error", resp.Error)
+			// Do NOT mark alive — let caller handle the error and trigger restart
 			break
 		}
 	}

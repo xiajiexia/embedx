@@ -23,6 +23,49 @@ import chromadb
 from chromadb.config import Settings
 from fastembed import TextEmbedding
 
+# Fallback mirror when huggingface.co is inaccessible
+HF_FALLBACK_ENDPOINT = "https://hf-mirror.com"
+
+
+def _is_network_error(exc: Exception) -> bool:
+    """Return True if exception looks like a network/download failure."""
+    name = type(exc).__name__.lower()
+    msg = str(exc).lower()
+    network_keywords = (
+        "timeout", "connect", "network", "read error", "read timed out",
+        "connection refused", "connection reset", "dns", "proxy",
+        "host unreachable", "no route to host", "httpcore", "httpx",
+        "sslv3", "ssl", "tls", "certificate", "handshake",
+    )
+    return any(k in msg or k in name for k in network_keywords)
+
+
+def _try_load_model(model_name: str, endpoint: Optional[str] = None):
+    """Load TextEmbedding, optionally using a specific HF endpoint."""
+    old_endpoint = os.environ.get("HF_ENDPOINT")
+    try:
+        if endpoint:
+            os.environ["HF_ENDPOINT"] = endpoint
+        else:
+            os.environ.pop("HF_ENDPOINT", None)
+        return TextEmbedding(model_name=model_name)
+    finally:
+        if old_endpoint is None:
+            os.environ.pop("HF_ENDPOINT", None)
+        else:
+            os.environ["HF_ENDPOINT"] = old_endpoint
+
+
+def _load_with_fallback(model_name: str):
+    """Load model, falling back to hf-mirror.com on network failure."""
+    try:
+        return _try_load_model(model_name)
+    except Exception as primary_err:
+        if not _is_network_error(primary_err):
+            raise
+        log_warn("Primary HF endpoint failed, trying fallback", endpoint=HF_FALLBACK_ENDPOINT, error=str(primary_err))
+        return _try_load_model(model_name, endpoint=HF_FALLBACK_ENDPOINT)
+
 # Use local ./models directory as HuggingFace cache (set by service env or defaults)
 # This avoids repeated downloads and ensures offline capability after first load
 if "HF_HUB_CACHE" not in os.environ:
@@ -265,8 +308,8 @@ def pull_model(model_name: str, stream_callback=None):
     try:
         start = time.time()
         # Trigger download by creating a temporary embedding instance
-        # This will download the model if not cached
-        emb = TextEmbedding(model_name=model_name)
+        # This will download the model if not cached, with fallback to hf-mirror
+        emb = _load_with_fallback(model_name)
         dims = emb.embedding_size
         elapsed = time.time() - start
         log_info("pull_model DONE", model=model_name, dimensions=dims, elapsed_ms=int(elapsed*1000), cached=get_cached_models())
@@ -295,7 +338,7 @@ def load_model(model_name: str):
         try:
             start = time.time()
             with _cache_lock:
-                _model_cache[model_name] = TextEmbedding(model_name=model_name)
+                _model_cache[model_name] = _load_with_fallback(model_name)
             elapsed = time.time() - start
             log_info("Model loaded into cache", model=model_name, elapsed_ms=int(elapsed*1000))
         except Exception as e:
@@ -427,10 +470,10 @@ def main():
     default_model = sys.argv[1] if len(sys.argv) > 1 else "BAAI/bge-small-zh-v1.5"
     log_info("Startup: loading default model", default_model=default_model)
 
-    # Load default model on startup
+    # Load default model on startup (with fallback to hf-mirror)
     try:
         start = time.time()
-        _model_cache[default_model] = TextEmbedding(model_name=default_model)
+        _model_cache[default_model] = _load_with_fallback(default_model)
         _current_model = default_model
         desc = _model_cache[default_model]
         elapsed = time.time() - start
@@ -444,8 +487,8 @@ def main():
     except Exception as e:
         log_traceback(e, "startup model load")
         log_error("Startup: FAILED to load default model", model=default_model, error=str(e))
-        # Still signal ready so Go server can start (may be retryable)
-        print(json.dumps({"event": "ready", "error": str(e)}), flush=True)
+        # Signal error so Go restarts Python instead of marking it alive with a broken model
+        print(json.dumps({"event": "error", "model": default_model, "error": str(e)}), flush=True)
 
     log_info("Entering command loop", stdin_fd=sys.stdin.fileno())
 
