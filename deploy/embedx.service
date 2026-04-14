@@ -1,0 +1,22 @@
+[Unit]
+Description=embedx - FastEmbed with Ollama-compatible API
+After=network.target
+
+[Service]
+Type=simple
+User={{USER}}
+Group={{GROUP}}
+WorkingDirectory={{DEPLOY_PATH}}
+ExecStart={{DEPLOY_PATH}}/embedx
+Restart=always
+RestartSec=5
+Environment=EMBEDX_PORT=11434
+Environment=EMBEDX_MODEL=BAAI/bge-small-zh-v1.5
+Environment=HTTP_PROXY=http://127.0.0.1:1087
+Environment=HTTPS_PROXY=http://127.0.0.1:1087
+Environment=NO_PROXY=localhost,127.0.0.1
+Environment=HF_HUB_CACHE={{DEPLOY_PATH}}/models
+Environment=TRANSFORMERS_CACHE={{DEPLOY_PATH}}/models
+
+[Install]
+WantedBy=multi-user.target

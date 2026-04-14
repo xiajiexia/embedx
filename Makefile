@@ -1,90 +1,153 @@
-.PHONY: build run test clean install start stop uninstall
+.PHONY: build run test test-pull test-tags health clean install start stop restart restart-py logs uninstall deploy help
 
 # Build the binary
 build:
-	go build -o embedx .
+	@echo "🔨 Building embedx..."
+	@go build -o embedx .
+	@echo "✅ Build complete"
 
 # Run locally
 run:
-	./embedx
+	@echo "🚀 Starting embedx locally..."
+	@./embedx
 
 # Test the API
 test:
-	curl -X POST http://localhost:11434/api/embeddings \
+	@echo "🧪 Testing embedding API..."
+	@curl -s -X POST http://localhost:11434/api/embeddings \
 		-H "Content-Type: application/json" \
-		-d '{"model": "BAAI/bge-small-zh-v1.5", "prompt": "你好世界"}'
+		-d '{"model": "BAAI/bge-small-zh-v1.5", "prompt": "你好世界"}' | head -c 200
+	@echo "..."
 
-# Test pull
+# Test pull model
 test-pull:
-	curl -X POST http://localhost:11434/api/pull \
+	@echo "📥 Pulling model..."
+	@curl -X POST http://localhost:11434/api/pull \
 		-H "Content-Type: application/json" \
 		-d '{"name": "BAAI/bge-base-en-v1.5"}'
 
 # Test list models
 test-tags:
-	curl http://localhost:11434/api/tags
+	@echo "📋 Listing models..."
+	@curl -s http://localhost:11434/api/tags | python3 -m json.tool 2>/dev/null || curl -s http://localhost:11434/api/tags
 
 # Health check
 health:
-	curl http://localhost:11434/health
+	@echo "🏥 Health check..."
+	@curl -s http://localhost:11434/health && echo ""
 
 # Clean build artifacts
 clean:
-	rm -f embedx
+	@echo "🧹 Cleaning..."
+	@rm -f embedx
+	@echo "✅ Clean complete"
 
-# Install to /opt/embedx
+# Install to /opt/embedx and enable systemd service
 install: build
-	sudo mkdir -p /opt/embedx
-	sudo mkdir -p /opt/embedx/models
-	sudo chown -R $$USER /opt/embedx
-	sudo cp embedx /opt/embedx/
-	sudo cp embed.py /opt/embedx/
-	sudo chmod +x /opt/embedx/embedx
-	printf '%s\n' \
-		'[Unit]' \
-		'Description=embedx - FastEmbed with Ollama-compatible API' \
-		'After=network.target' \
-		'' \
-		'[Service]' \
-		'Type=simple' \
-		'User=$(shell whoami)' \
-		'WorkingDirectory=/opt/embedx' \
-		'ExecStart=/opt/embedx/embedx' \
-		'Restart=always' \
-		'RestartSec=5' \
-		'Environment=EMBEDX_PORT=11434' \
-		'Environment=EMBEDX_MODEL=BAAI/bge-small-zh-v1.5' \
-		'Environment=HTTP_PROXY=http://127.0.0.1:1087' \
-		'Environment=HTTPS_PROXY=http://127.0.0.1:1087' \
-		'Environment=NO_PROXY=localhost,127.0.0.1' \
-		'Environment=HF_HUB_CACHE=/opt/embedx/models' \
-		'Environment=TRANSFORMERS_CACHE=/opt/embedx/models' \
-		'' \
-		'[Install]' \
-		'WantedBy=multi-user.target' | sudo tee /etc/systemd/system/embedx.service > /dev/null
-	sudo systemctl daemon-reload
+	@CURRENT_USER=$$(whoami) && \
+	CURRENT_GROUP=$$(id -gn) && \
+	DEPLOY_PATH="/opt/embedx" && \
+	echo "📦 Installing to $$DEPLOY_PATH (user: $$CURRENT_USER)..." && \
+	sed "s/{{USER}}/$$CURRENT_USER/g; s/{{GROUP}}/$$CURRENT_GROUP/g; s|{{DEPLOY_PATH}}|$$DEPLOY_PATH|g" \
+		deploy/embedx.service | sudo tee /etc/systemd/system/embedx.service > /dev/null && \
+	sudo mkdir -p $$DEPLOY_PATH/models && \
+	sudo chown -R $$CURRENT_USER:$$CURRENT_GROUP $$DEPLOY_PATH && \
+	sudo cp embedx $$DEPLOY_PATH/ && \
+	sudo cp embed.py $$DEPLOY_PATH/ && \
+	sudo chmod +x $$DEPLOY_PATH/embedx && \
+	sudo systemctl daemon-reload && \
 	sudo systemctl enable embedx
+	@echo "✅ Installed to $$DEPLOY_PATH"
 
 # Start the service
 start:
-	sudo systemctl start embedx
+	@echo "▶️  Starting embedx service..."
+	@sudo systemctl start embedx
+	@sleep 1
+	@systemctl is-active embedx && echo "✅ Service started" || echo "❌ Start failed"
 
 # Stop the service
 stop:
-	sudo systemctl stop embedx
+	@echo "⏹️  Stopping embedx service..."
+	@sudo systemctl stop embedx
+	@echo "✅ Service stopped"
 
-# Restart the service (SIGTERM → graceful drain → restart)
+# Restart the service
 restart:
-	sudo systemctl restart embedx
+	@echo "🔄 Restarting embedx service..."
+	@sudo systemctl restart embedx
+	@sleep 1
+	@systemctl is-active embedx && echo "✅ Service restarted" || echo "❌ Restart failed"
+
+# Restart only the Python backend (hot reload model without restarting Go server)
+restart-py:
+	@echo "🔄 Restarting Python backend (model hot-reload)..."
+	@sudo kill -SIGUSR1 $$(systemctl show --property MainPID --value embedx) 2>/dev/null || echo "SIGUSR1 not supported, use restart instead"
+	@sleep 1
+	@systemctl is-active embedx && echo "✅ Python backend restarted" || echo "❌ Restart failed"
 
 # View logs
 logs:
-	sudo journalctl -u embedx -f
+	@sudo journalctl -u embedx -f
+
+# View recent logs
+logs-recent:
+	@sudo journalctl -u embedx -n 50 --no-pager
 
 # Uninstall
 uninstall:
-	sudo systemctl stop embedx || true
-	sudo systemctl disable embedx || true
-	sudo rm -f /etc/systemd/system/embedx.service
-	sudo systemctl daemon-reload
-	sudo rm -rf /opt/embedx
+	@echo "🗑️  Uninstalling embedx service..."
+	@sudo systemctl stop embedx 2>/dev/null || true
+	@sudo systemctl disable embedx 2>/dev/null || true
+	@sudo rm -f /etc/systemd/system/embedx.service
+	@sudo systemctl daemon-reload
+	@echo "✅ Service uninstalled"
+	@echo "⚠️  Note: /opt/embedx not removed (contains models). Remove manually if needed:"
+	@echo "    sudo rm -rf /opt/embedx"
+
+# Deploy: build -> stop -> deploy -> restart
+deploy: build
+	@CURRENT_USER=$$(whoami) && \
+	CURRENT_GROUP=$$(id -gn) && \
+	DEPLOY_PATH="/opt/embedx" && \
+	echo "📦 Deploying to $$DEPLOY_PATH (user: $$CURRENT_USER)..." && \
+	sed "s/{{USER}}/$$CURRENT_USER/g; s/{{GROUP}}/$$CURRENT_GROUP/g; s|{{DEPLOY_PATH}}|$$DEPLOY_PATH|g" \
+		deploy/embedx.service | sudo tee /etc/systemd/system/embedx.service > /dev/null && \
+	echo "⏹️  Stopping old service..." && \
+	sudo systemctl stop embedx 2>/dev/null || true && \
+	sudo mkdir -p $$DEPLOY_PATH && \
+	sudo mkdir -p $$DEPLOY_PATH/models && \
+	sudo chown -R $$CURRENT_USER:$$CURRENT_GROUP $$DEPLOY_PATH && \
+	sudo cp embedx $$DEPLOY_PATH/ && \
+	sudo cp embed.py $$DEPLOY_PATH/ && \
+	sudo chmod +x $$DEPLOY_PATH/embedx && \
+	sudo systemctl daemon-reload && \
+	echo "🔄 Restarting service..." && \
+	sudo systemctl restart embedx && \
+	sleep 2 && \
+	systemctl is-active embedx && echo "✅ Deploy complete" || echo "❌ Start failed"
+
+# Help
+help:
+	@echo "embedx - FastEmbed with Ollama-compatible API"
+	@echo ""
+	@echo "  make build        Build the binary"
+	@echo "  make run          Run locally (foreground)"
+	@echo "  make test         Test embedding API"
+	@echo "  make test-pull    Pull a model"
+	@echo "  make test-tags    List available models"
+	@echo "  make health       Health check"
+	@echo "  make install      Install to /opt/embedx + enable systemd"
+	@echo "  make deploy       Build + stop + deploy + restart (one command)"
+	@echo "  make start        Start systemd service"
+	@echo "  make stop         Stop systemd service"
+	@echo "  make restart      Restart systemd service"
+	@echo "  make restart-py   Hot-reload Python backend (model swap)"
+	@echo "  make logs         Tail service logs (-f)"
+	@echo "  make logs-recent  Show recent logs"
+	@echo "  make uninstall    Stop and disable systemd service"
+	@echo "  make clean        Remove build artifacts"
+	@echo ""
+	@echo "Deploy path: /opt/embedx (fixed)"
+	@echo "Port: 11434"
+	@echo "Default model: BAAI/bge-small-zh-v1.5"
